@@ -25,24 +25,18 @@ def set_seed(seed=1234):
 
 
 def get_grl_lambda(epoch, total_epochs, warmup_epochs=15, max_lambda=0.3):
-    """
-    Smooth GRL schedule.
-    No adversarial pressure during warmup.
-    Then gradually increase.
-    """
     if epoch <= warmup_epochs:
         return 0.0
 
     progress = (epoch - warmup_epochs) / max(1, (total_epochs - warmup_epochs))
     progress = min(max(progress, 0.0), 1.0)
-
-    # smooth logistic-style ramp
     lam = 2.0 / (1.0 + np.exp(-10.0 * progress)) - 1.0
     return float(max_lambda * lam)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Clean GRL camera-adversarial training')
+
     parser.add_argument('--Dataset_name', required=True, type=str)
     parser.add_argument('--model_path', required=True, type=str, help='ViT pretrained weight path')
     parser.add_argument('--output_dir', default='./output_camera_removed_grl_clean', type=str)
@@ -86,8 +80,9 @@ if __name__ == '__main__':
     )
     center_criterion = center_criterion.to(device)
 
-    optimizer_center = torch.optim.SGD(center_criterion.parameters(), lr=0.5)
     optimizer_main = optimizer(model)
+    optimizer_center = torch.optim.SGD(center_criterion.parameters(), lr=0.5)
+
     lr_scheduler = scheduler(optimizer_main)
     scaler = amp.GradScaler(enabled=(device == 'cuda'))
 
@@ -134,29 +129,21 @@ if __name__ == '__main__':
             pid = pid.to(device, non_blocking=True)
             labels2 = labels2.to(device, non_blocking=True)
 
-            # ---------------------------------------------------------
-            # IMPORTANT FIX:
-            # target_cam may come as [B, T] or [B*T]
-            # camera classifier expects one label per sequence: [B]
-            # ---------------------------------------------------------
             target_cam = target_cam.to(device, non_blocking=True)
-
             if target_cam.dim() == 2:
-                # shape [B, T] -> pick one cam label per sequence
                 target_cam_seq = target_cam[:, 0].contiguous().long()
             elif target_cam.dim() == 1:
-                # if already [B], keep as-is
                 if target_cam.size(0) == img.size(0):
                     target_cam_seq = target_cam.contiguous().long()
                 else:
-                    # if flattened [B*T], reshape to [B, T]
                     target_cam_seq = target_cam.view(img.size(0), -1)[:, 0].contiguous().long()
             else:
                 raise ValueError(f'Unexpected target_cam shape: {target_cam.shape}')
 
+            # ---------------------------
+            # Main loss under AMP
+            # ---------------------------
             with amp.autocast(enabled=(device == 'cuda')):
-                # expected model return during training:
-                # score, feat, a_vals, cam_logits
                 score, feat, a_vals, cam_logits = model(
                     img,
                     pid,
@@ -175,25 +162,28 @@ if __name__ == '__main__':
                     target_cam=target_cam_seq
                 )
 
-                center_loss = center_criterion(feat, pid)
+                main_loss = idtri_loss + attn_loss + args.cam_loss_w * cam_loss
 
-                loss = (
-                    idtri_loss
-                    + args.center_w * center_loss
-                    + attn_loss
-                    + args.cam_loss_w * cam_loss
-                )
-
-            scaler.scale(loss).backward()
+            scaler.scale(main_loss).backward(retain_graph=(args.center_w > 0))
             scaler.step(optimizer_main)
             scaler.update()
 
-            # center loss update
+            # ---------------------------
+            # Center loss in full precision
+            # ---------------------------
             if args.center_w > 0:
+                center_loss = center_criterion(feat, pid)
+                (args.center_w * center_loss).backward()
+
                 for param in center_criterion.parameters():
                     if param.grad is not None:
                         param.grad.data *= (1.0 / args.center_w)
+
                 optimizer_center.step()
+            else:
+                center_loss = idtri_loss.new_tensor(0.0)
+
+            total_loss = main_loss.detach() + args.center_w * center_loss.detach()
 
             if isinstance(score, list):
                 acc = (score[0].max(1)[1] == pid).float().mean()
@@ -202,7 +192,7 @@ if __name__ == '__main__':
 
             batch_size = img.shape[0]
 
-            total_loss_meter.update(loss.item(), batch_size)
+            total_loss_meter.update(total_loss.item(), batch_size)
             idtri_loss_meter.update(idtri_loss.item(), batch_size)
             center_loss_meter.update(center_loss.item(), batch_size)
             cam_loss_meter.update(cam_loss.item(), batch_size)
@@ -214,7 +204,7 @@ if __name__ == '__main__':
             if iteration % 50 == 0:
                 print(
                     'Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e} | '
-                    'id={:.3f} cam={:.3f} grl={:.3f}'.format(
+                    'id={:.3f} center={:.3f} cam={:.3f} grl={:.3f}'.format(
                         epoch,
                         iteration,
                         len(train_loader),
@@ -222,6 +212,7 @@ if __name__ == '__main__':
                         acc_meter.avg,
                         lr_scheduler._get_lr(epoch)[0],
                         idtri_loss_meter.avg,
+                        center_loss_meter.avg,
                         cam_loss_meter.avg,
                         grl_lambda
                     )
